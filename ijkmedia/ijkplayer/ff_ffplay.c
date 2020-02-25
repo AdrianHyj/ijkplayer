@@ -563,6 +563,176 @@ fail0:
     return ret;
 }
 
+//插入录制方法
+int ffp_start_recording_l(FFPlayer *ffp,const char *file_name)
+{
+    assert(ffp);
+    VideoState *is = ffp->is;
+
+    ffp->m_ofmt_ctx = NULL;
+    ffp->m_ofmt = NULL;
+    ffp->is_record = 0;
+    ffp->record_error = 0;
+
+    if (!file_name || !strlen(file_name)) { // 没有路径
+        av_log(ffp, AV_LOG_ERROR, "filename is invalid");
+        goto end;
+    }
+
+    if (!is || !is->ic|| is->paused || is->abort_request) { // 没有上下文，或者上下文已经停止
+        av_log(ffp, AV_LOG_ERROR, "is,is->ic,is->paused is invalid");
+        goto end;
+    }
+
+    if (ffp->is_record) { // 已经在录制
+        av_log(ffp, AV_LOG_ERROR, "recording has started");
+        goto end;
+    }
+
+    // 初始化一个用于输出的AVFormatContext结构体
+    avformat_alloc_output_context2(&ffp->m_ofmt_ctx, NULL, NULL, file_name);
+    if (!ffp->m_ofmt_ctx) {
+        av_log(ffp, AV_LOG_ERROR, "Could not create output context filename is %s\n", file_name);
+        goto end;
+    }
+    ffp->m_ofmt = ffp->m_ofmt_ctx->oformat;
+
+    for (int i = 0; i < is->ic->nb_streams; i++) {
+        // 对照输入流创建输出流通道
+        AVStream *in_stream = is->ic->streams[i];
+        AVStream *out_stream = avformat_new_stream(ffp->m_ofmt_ctx, in_stream->codec->codec);
+        if (!out_stream) {
+            av_log(ffp, AV_LOG_ERROR, "Failed allocating output stream\n");
+            goto end;
+        }
+
+        // 将输入视频/音频的参数拷贝至输出视频/音频的AVCodecContext结构体
+        av_log(ffp, AV_LOG_DEBUG, "in_stream->codec；%p\n", in_stream->codec);
+        if (avcodec_copy_context(out_stream->codec, in_stream->codec) < 0) {
+            av_log(ffp, AV_LOG_ERROR, "Failed to copy context from input to output stream codec context\n");
+            goto end;
+        }
+
+        out_stream->codec->codec_tag = 0;
+        if (ffp->m_ofmt_ctx->oformat->flags & AVFMT_GLOBALHEADER) {
+            out_stream->codec->flags |= CODEC_FLAG_GLOBAL_HEADER;
+        }
+    }
+
+    av_dump_format(ffp->m_ofmt_ctx, 0, file_name, 1);
+
+    // 打开输出文件
+    if (!(ffp->m_ofmt->flags & AVFMT_NOFILE)) {
+        if (avio_open(&ffp->m_ofmt_ctx->pb, file_name, AVIO_FLAG_WRITE) < 0) {
+            av_log(ffp, AV_LOG_ERROR, "Could not open output file '%s'", file_name);
+            goto end;
+        }
+    }
+
+    // 写视频文件头
+    if (avformat_write_header(ffp->m_ofmt_ctx, NULL) < 0) {
+        av_log(ffp, AV_LOG_ERROR, "Error occurred when opening output file\n");
+        goto end;
+    }
+
+    ffp->is_record = 1;
+    ffp->record_error = 0;
+    pthread_mutex_init(&ffp->record_mutex, NULL);
+
+    return 0;
+end:
+    ffp->record_error = 1;
+    return -1;
+}
+
+int ffp_record_isfinished_l(FFPlayer *ffp)
+{
+    return 0;
+}
+
+int ffp_record_file(FFPlayer *ffp, AVPacket *packet)
+{
+    assert(ffp);
+    VideoState *is = ffp->is;
+    int ret = 0;
+    AVStream *in_stream;
+    AVStream *out_stream;
+
+    if (ffp->is_record) {
+        if (packet == NULL) {
+            ffp->record_error = 1;
+            av_log(ffp, AV_LOG_ERROR, "packet == NULL");
+            printf("ffp_record_file return null 1");
+            return -1;
+        }
+
+        AVPacket *pkt = (AVPacket *)av_malloc(sizeof(AVPacket)); // 与看直播的 AVPacket分开，不然卡屏
+        av_new_packet(pkt, 0);
+        if (0 == av_packet_ref(pkt, packet)) {
+            pthread_mutex_lock(&ffp->record_mutex);
+
+            if (!ffp->is_first) { // 录制的第一帧，时间从0开始
+                ffp->is_first = 1;
+                pkt->pts = 0;
+                pkt->dts = 0;
+            } else { // 之后的每一帧都要减去，点击开始录制时的值，这样的时间才是正确的
+                pkt->pts = llabs(pkt->pts - ffp->start_pts);
+                pkt->dts = llabs(pkt->dts - ffp->start_dts);
+                printf("AVMEDIA_TYPE_VIDEO pkt->pts == %lld pkt->dts == %lld\n",pkt->pts,pkt->dts);
+            }
+
+            in_stream  = is->ic->streams[pkt->stream_index];
+            out_stream = ffp->m_ofmt_ctx->streams[pkt->stream_index];
+
+            // 转换PTS/DTS
+            pkt->pts = av_rescale_q_rnd(pkt->pts, in_stream->time_base, out_stream->time_base, (AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX));
+            pkt->dts = av_rescale_q_rnd(pkt->dts, in_stream->time_base, out_stream->time_base, (AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX));
+            pkt->duration = av_rescale_q(pkt->duration, in_stream->time_base, out_stream->time_base);
+            pkt->pos = -1;
+
+            // 写入一个AVPacket到输出文件
+            av_interleaved_write_frame(ffp->m_ofmt_ctx, pkt);
+//            printf("Cur pkt->pts == %lld pkt->dts == %lld\n",pkt->pts,pkt->dts);
+//            if ((ret = av_interleaved_write_frame(ffp->m_ofmt_ctx, pkt)) < 0) {
+//                av_log(ffp, AV_LOG_ERROR, "Error muxing packet\n");
+//            }
+
+            av_packet_unref(pkt);
+            pthread_mutex_unlock(&ffp->record_mutex);
+        } else {
+            av_log(ffp, AV_LOG_ERROR, "av_packet_ref == NULL");
+            printf("ffp_record_file return null 2");
+        }
+    }
+    printf("ffp_record_file return null 3 == %d\n",ret);
+    return ret;
+}
+
+
+int ffp_stop_recording_l(FFPlayer *ffp){
+    assert(ffp);
+    if (ffp->is_record) {
+        ffp->is_record = 0;
+        pthread_mutex_lock(&ffp->record_mutex);
+        if (ffp->m_ofmt_ctx != NULL) {
+            av_write_trailer(ffp->m_ofmt_ctx);
+            if (ffp->m_ofmt_ctx && !(ffp->m_ofmt->flags & AVFMT_NOFILE)) {
+                avio_close(ffp->m_ofmt_ctx->pb);
+            }
+            avformat_free_context(ffp->m_ofmt_ctx);
+            ffp->m_ofmt_ctx = NULL;
+            ffp->is_first = 0;
+        }
+        pthread_mutex_unlock(&ffp->record_mutex);
+        pthread_mutex_destroy(&ffp->record_mutex);
+        av_log(ffp, AV_LOG_DEBUG, "stopRecord ok\n");
+    } else {
+        av_log(ffp, AV_LOG_ERROR, "don't need stopRecord\n");
+    }
+    return 0;
+}
+
+
 static int decoder_decode_frame(FFPlayer *ffp, Decoder *d, AVFrame *frame, AVSubtitle *sub) {
     int ret = AVERROR(EAGAIN);
 
@@ -3057,6 +3227,122 @@ static int is_realtime(AVFormatContext *s)
     return 0;
 }
 
+//==========================================暴走大牙，丢帧处理--->https://www.jianshu.com/p/d6a5d8756eec?utm_campaign=hugo&utm_medium=reader_share&utm_content=note&utm_source=qq
+
+static void drop_queue_until_pts(PacketQueue *q, int64_t drop_to_pts) {
+    MyAVPacketList *pkt1 = NULL;
+    int del_nb_packets = 0;
+    for (;;) {
+        pkt1 = q->first_pkt;
+        if (!pkt1) {
+            break;
+        }
+        // video need key frame? 这里如果不判断是否是关键帧会导致视频画面花屏。但是这样会导致全部清空的可能也会出现花屏
+        // 所以这里推流端设置好 GOP 的大小，如果 max_cached_duration > 2 * GOP，可以尽可能规避全部清空
+        // 也可以在调用control_queue_duration之前判断新进来的视频pkt是否是关键帧，这样即使全部清空了也不会花屏
+        if ((pkt1->pkt.flags & AV_PKT_FLAG_KEY) && pkt1->pkt.pts >= drop_to_pts) {
+//        if (pkt1->pkt.pts >= drop_to_pts) {
+            break;
+        }
+        q->first_pkt = pkt1->next;
+        if (!q->first_pkt)
+            q->last_pkt = NULL;
+        q->nb_packets--;
+        ++del_nb_packets;
+        q->size -= pkt1->pkt.size + sizeof(*pkt1);
+        if (pkt1->pkt.duration > 0)
+            q->duration -= pkt1->pkt.duration;
+        av_free_packet(&pkt1->pkt);
+#ifdef FFP_MERGE
+        av_free(pkt1);
+#else
+        pkt1->next = q->recycle_pkt;
+        q->recycle_pkt = pkt1;
+#endif
+    }
+    av_log(NULL, AV_LOG_INFO, "233 del_nb_packets = %d.\n", del_nb_packets);
+}
+
+static void control_video_queue_duration(FFPlayer *ffp, VideoState *is) {
+    int time_base_valid = 0;
+    int64_t cached_duration = -1;
+    int nb_packets = 0;
+    int64_t duration = 0;
+    int64_t drop_to_pts = 0;
+
+    //Lock
+    SDL_LockMutex(is->videoq.mutex);
+
+    time_base_valid = is->video_st->time_base.den > 0 && is->video_st->time_base.num > 0;
+    nb_packets = is->videoq.nb_packets;
+
+    // TOFIX: if time_base_valid false, calc duration with nb_packets and framerate
+    // 为什么不用 videoq.duration？因为遇到过videoq.duration 一直为0，audioq也一样
+    if (time_base_valid) {
+        if (is->videoq.first_pkt && is->videoq.last_pkt) {
+            duration = is->videoq.last_pkt->pkt.pts - is->videoq.first_pkt->pkt.pts;
+            cached_duration = duration * av_q2d(is->video_st->time_base) * 1000;
+        }
+    }
+
+    if (cached_duration > is->max_cached_duration) {
+        // drop
+        av_log(NULL, AV_LOG_INFO, "233 video cached_duration = %lld, nb_packets = %d.\n", cached_duration, nb_packets);
+        drop_to_pts = is->videoq.last_pkt->pkt.pts - (duration / 2);  // 这里删掉一半，你也可以自己修改，依据设置进来的max_cached_duration大小
+        drop_queue_until_pts(&is->videoq, drop_to_pts);
+    }
+
+    //Unlock
+    SDL_UnlockMutex(is->videoq.mutex);
+}
+
+static void control_audio_queue_duration(FFPlayer *ffp, VideoState *is) {
+    int time_base_valid = 0;
+    int64_t cached_duration = -1;
+    int nb_packets = 0;
+    int64_t duration = 0;
+    int64_t drop_to_pts = 0;
+
+    //Lock
+    SDL_LockMutex(is->audioq.mutex);
+
+    time_base_valid = is->audio_st->time_base.den > 0 && is->audio_st->time_base.num > 0;
+    nb_packets = is->audioq.nb_packets;
+
+    // TOFIX: if time_base_valid false, calc duration with nb_packets and samplerate
+    if (time_base_valid) {
+        if (is->audioq.first_pkt && is->audioq.last_pkt) {
+            duration = is->audioq.last_pkt->pkt.pts - is->audioq.first_pkt->pkt.pts;
+            cached_duration = duration * av_q2d(is->audio_st->time_base) * 1000;
+        }
+    }
+
+    if (cached_duration > is->max_cached_duration) {
+        // drop
+        av_log(NULL, AV_LOG_INFO, "233 audio cached_duration = %lld, nb_packets = %d.\n", cached_duration, nb_packets);
+        drop_to_pts = is->audioq.last_pkt->pkt.pts - (duration / 2);
+        drop_queue_until_pts(&is->audioq, drop_to_pts);
+    }
+
+    //Unlock
+    SDL_UnlockMutex(is->audioq.mutex);
+}
+
+static void control_queue_duration(FFPlayer *ffp, VideoState *is) {
+    if (is->max_cached_duration <= 0) {
+        return;
+    }
+
+    if (is->audio_st) {
+        return control_audio_queue_duration(ffp, is);
+    }
+    if (is->video_st) {
+        return control_video_queue_duration(ffp, is);
+    }
+
+}
+
+//==========================================丢帧处理End=================================================
 /* this thread gets the stream from the disk or the network */
 static int read_thread(void *arg)
 {
@@ -3090,14 +3376,18 @@ static int read_thread(void *arg)
     is->last_subtitle_stream = is->subtitle_stream = -1;
     is->eof = 0;
 
+    // 创建一个以默认值初始化的AVFormatContext
     ic = avformat_alloc_context();
     if (!ic) {
         av_log(NULL, AV_LOG_FATAL, "Could not allocate context.\n");
         ret = AVERROR(ENOMEM);
         goto fail;
     }
+    // 设置interrupt_callback
     ic->interrupt_callback.callback = decode_interrupt_cb;
     ic->interrupt_callback.opaque = is;
+
+    // 特定选项处理
     if (!av_dict_get(ffp->format_opts, "scan_all_pmts", NULL, AV_DICT_MATCH_CASE)) {
         av_dict_set(&ffp->format_opts, "scan_all_pmts", "1", AV_DICT_DONT_OVERWRITE);
         scan_all_pmts_set = 1;
@@ -3116,6 +3406,8 @@ static int read_thread(void *arg)
 
     if (ffp->iformat_name)
         is->iformat = av_find_input_format(ffp->iformat_name);
+
+    // 执行avformat_open_input
     err = avformat_open_input(&ic, is->filename, is->iformat, &ffp->format_opts);
     if (err < 0) {
         print_error(is->filename, err);
@@ -3208,7 +3500,21 @@ static int read_thread(void *arg)
         }
     }
 
-    is->realtime = is_realtime(ic);
+//  is->realtime = is_realtime(ic);
+//  加入丢帧处理
+    is->realtime = 0;
+    AVDictionaryEntry *e = av_dict_get(ffp->player_opts, "max_cached_duration", NULL, 0);
+    if (e) {
+        int max_cached_duration = atoi(e->value);
+        if (max_cached_duration <= 0) {
+            is->max_cached_duration = 0;
+        } else {
+            is->max_cached_duration = max_cached_duration;
+        }
+    } else {
+        is->max_cached_duration = 0;
+    }
+
 
     av_dump_format(ic, 0, is->filename, 0);
 
@@ -3343,9 +3649,24 @@ static int read_thread(void *arg)
         ffp_seek_to_l(ffp, (long)(ffp->seek_at_start));
     }
 
+    // 开始读取数据
     for (;;) {
         if (is->abort_request)
             break;
+
+
+        if (!ffp->is_first && pkt->pts == pkt->dts) { // 获取开始录制前dts等于pts最后的值，用于
+             ffp->start_pts = pkt->pts;
+             ffp->start_dts = pkt->dts;
+        }
+
+        if (ffp->is_record) { // 可以录制时，写入文件
+           if (0 != ffp_record_file(ffp, pkt)) {
+               ffp->record_error = 1;
+               ffp_stop_recording_l(ffp);
+           }
+        }
+
 #ifdef FFP_MERGE
         if (is->paused != is->last_paused) {
             is->last_paused = is->paused;
@@ -3512,6 +3833,7 @@ static int read_thread(void *arg)
             }
         }
         pkt->flags = 0;
+
         ret = av_read_frame(ic, pkt);
         if (ret < 0) {
             int pb_eof = 0;
@@ -3586,6 +3908,12 @@ static int read_thread(void *arg)
                 av_q2d(ic->streams[pkt->stream_index]->time_base) -
                 (double)(ffp->start_time != AV_NOPTS_VALUE ? ffp->start_time : 0) / 1000000
                 <= ((double)ffp->duration / 1000000);
+        // 每次读取一个pkt，都去判断处理
+        // TODO:优化，不用每次都调用
+        if (is->max_cached_duration > 0) {
+           control_queue_duration(ffp, is);
+        }
+
         if (pkt->stream_index == is->audio_stream && pkt_in_play_range) {
             packet_queue_put(&is->audioq, pkt);
         } else if (pkt->stream_index == is->video_stream && pkt_in_play_range
@@ -5037,3 +5365,5 @@ IjkMediaMeta *ffp_get_meta_l(FFPlayer *ffp)
 
     return ffp->meta;
 }
+
+

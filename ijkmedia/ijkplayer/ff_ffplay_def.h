@@ -418,6 +418,9 @@ typedef struct VideoState {
     SDL_cond  *audio_accurate_seek_cond;
     volatile int initialized_decoder;
     int seek_buffering;
+// for low delay time with live play(realtime), control videoq/audioq duration < max_cached_duration
+ // realtime set to 0, max_cached_duration = 0 means is playback
+    int max_cached_duration;
 } VideoState;
 
 /* options specified by the user */
@@ -565,6 +568,8 @@ typedef struct FFPlayer {
     AVDictionary *player_opts;
     AVDictionary *swr_opts;
     AVDictionary *swr_preset_opts;
+
+
 
     /* ffplay options specified by the user */
 #ifdef FFP_MERGE
@@ -720,6 +725,17 @@ typedef struct FFPlayer {
     char *mediacodec_default_name;
     int ijkmeta_delay_init;
     int render_wait_start;
+
+     AVFormatContext *m_ofmt_ctx;        // 用于输出的AVFormatContext结构体
+     AVOutputFormat *m_ofmt;
+     pthread_mutex_t record_mutex;       // 锁
+     int is_record;                      // 是否在录制
+     int record_error;
+
+     int is_first;                       // 第一帧数据
+     int64_t start_pts;                  // 开始录制时pts
+     int64_t start_dts;                  // 开始录制时dts
+
 } FFPlayer;
 
 #define fftime_to_milliseconds(ts) (av_rescale(ts, 1000, AV_TIME_BASE))
@@ -893,3 +909,4 @@ inline static const char *ffp_get_error_string(int error) {
 #define MEDIACODEC_MODULE_NAME "MediaCodec"
 
 #endif
+
