@@ -1818,6 +1818,13 @@ static int ijkff_inject_callback(void *opaque, int message, void *data, size_t d
     NSLog(@"stop record");
 }
 
+- (void)startRecordWithSavePath:(NSString *) path fileName:(NSString *) fileName {
+    NSString *savePath = [NSString stringWithFormat:@"%@%@", path, fileName];
+    // 视频存储的路径
+    const char *pathChar = [savePath cStringUsingEncoding:NSUTF8StringEncoding];
+    ijkmp_start_recording (_mediaPlayer, pathChar);
+}
+
 - (void)startRecordWithFileName:(NSString *)fileName {
     NSURL *cacheUrl = [NSFileManager.defaultManager URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask][0];
     NSString *savePath = [NSString stringWithFormat:@"%@%@",cacheUrl.absoluteString,fileName];
