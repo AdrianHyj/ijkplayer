@@ -37,7 +37,7 @@
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.textView.text = @"rtmp://as02.sca.im:51935/live/jintest007";
+    self.textView.text = @"rtmp://as02.sca.im:51935/live/jintest07";
 }
 
 - (void)onClickPlayButton {
