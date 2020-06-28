@@ -82,11 +82,9 @@
     [options setOptionIntValue:100L forKey:@"analyzemaxduration" ofCategory:1];
     [options setOptionIntValue:200 forKey:@"probesize" ofCategory:1];
     [options setOptionIntValue:1L forKey:@"flush_packets" ofCategory:1];
-    [options setOptionIntValue:1L forKey:@"framedrop" ofCategory:4];
 
     [options setFormatOptionIntValue:1024 * 16 forKey:@"probsize"];
     [options setFormatOptionIntValue:50000 forKey:@"analyzeduration"];
-    [options setPlayerOptionIntValue:0 forKey:@"videotoolbox"];
     [options setCodecOptionIntValue:IJK_AVDISCARD_DEFAULT forKey:@"skip_loop_filter"];
     [options setCodecOptionIntValue:IJK_AVDISCARD_DEFAULT forKey:@"skip_frame"];
 
